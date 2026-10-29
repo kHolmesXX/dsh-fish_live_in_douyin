@@ -1,3 +1,34 @@
+# dsh-fish_live_in_douyin —— 她住在抖音里的家（fish 版）
+
+> 这是 [`NEWJO123/dsh-douyin-scroll`](https://github.com/NEWJO123/dsh-douyin-scroll) **v0.5.4 的 fork 增强版**：
+> 上游负责「刷抖音 → 筛 → 发」；这一版在上面加了一层 **「她」** —— 人设、记忆、日记、关系档案、
+> 自己的生活节奏、主动联系、评论区互动、看懂视频、她的家控制台。
+
+## 这是什么 / 怎么用
+
+| 想看什么 | 看哪里 |
+|---|---|
+| 这一版比上游多了什么 | [FISH.md](FISH.md)（差异清单在 `FISH-PATCHES.md`） |
+| 怎么安装 / 验证 / 打包 / 排障 | [INSTALL.md](INSTALL.md) |
+| 第一次用（三步，不用敲命令） | [GUIDE.md](GUIDE.md) |
+| 给 AI 看的接入说明 | [AI-USAGE.md](AI-USAGE.md) |
+| 推仓库 / 发布流程 | [PUBLISH.md](PUBLISH.md) |
+
+## 安装（Releases 里有 tgz）
+
+```powershell
+# 1) 装插件（把路径换成你下载的 tgz）
+dsh plugin --profile desktop add file:<路径>\dsh-douyin-scroll-0.5.4-fish.28.tgz
+# 2) 重启 DSH
+# 3) 设置 → 刷抖音：装环境 → 扫码登录
+# 4) 设置 → 她的家：写人设/口味 → 选私信对象 → 打开世界开关
+```
+
+> 需要：Windows + Chrome + Python 3.10+ + DSH 桌面版（不需要 API key）。
+> 可选：看视频要 ffmpeg/ffprobe（听声音还要 faster-whisper 模型）。
+> 所有数据（人设/记忆/日记/登录态）都在 `%USERPROFILE%\.dsh\douyin-duty\`，升级插件不会丢。
+
+---
 # dsh-douyin-scroll ｜ 刷抖音
 
 > [!WARNING]
