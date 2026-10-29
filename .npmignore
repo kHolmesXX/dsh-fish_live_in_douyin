@@ -1,0 +1,68 @@
+# ============================================================================
+# .npmignore —— 发到 npm 时**不打包**的东西
+# ============================================================================
+
+# 🔴🔴🔴 最关键的一条：本地私有配置文件，绝不随包发布
+#   为什么需要单独一条：package.json 的 files 里写的是整个 `prompts` 目录，
+#   npm 会**递归**打进去 —— 而且 npm **不认 .gitignore**。
+#   2026-10-22 实测：不发这条的话，prompts/persona.md 真的进了 tgz。
+#   发布包只能有 persona.default.md（中性默认），使用者自己的写在 $DOUYIN_HOME/persona.md。
+prompts/persona.md
+persona.md
+
+# 本机跑 Python 生成的字节码（别人的 Python 版本对不上，白占体积）
+tools/__pycache__/
+tools/**/*.pyc
+__pycache__/
+*.pyc
+*.pyo
+
+# 开发/测试用的，使用者不需要
+_probe-*
+_msg*.txt
+_pkgtest/
+
+# 本机运行时数据（本来就在 $DSH_HOME，这里只是防手滑）
+config.json
+*.log
+out/
+memory/
+chrome-profile/
+.venv/
+venv/
+node_modules/
+
+# ============================================================================
+# 🔴 桌宠私货 —— 本插件已不含桌宠（2026-10-25 拆到 dsh-deskpet）
+#    规则保留：万一从老分支打包，也不许把这些发出去。
+#  · 微软的 WebView2 DLL：版权是微软的，不该跟着 MIT 包发
+#  · pet-udf*/：WebView2 的浏览器 profile（Cookies / History / Login Data
+#    全在里面）—— 那是使用者的真实浏览痕迹，发出去等于公开隐私
+#  · *.exe：本机编出来的产物，别人机器上没用（还跟平台绑定）
+#
+# 打包只该带**源码**（老分支上的 PetHost.cs / build-host.ps1）；
+# 编译好的 exe 由使用者自己的构建脚本生成。
+# ============================================================================
+tools/pet-host/*.exe
+tools/pet-host/*.exe.bak
+tools/pet-host/*.pdb
+tools/pet-host/*.dll
+tools/pet-host/*.config
+tools/pet-host/trace.txt
+tools/pet-host/pet-host-boot.log
+tools/pet-host/pet-udf/
+tools/pet-host/*-udf/
+tools/pet-host/*-udf-*/
+tools/pet-host/comp-probe/
+tools/pet-host/v7-test/
+tools/pet-host/dll-2903-bak/
+tools/pet-host/PetHost.v6-composite-bak.cs
+tools/pet-host/PetWin32Host.cs
+
+# 桌宠素材是主人的私货（PSD 拆层），只在本机；发布包里没有它
+assets/pet/
+
+# 排查用的一次性脚本 / 截图
+_scratch/
+*.png
+

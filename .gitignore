@@ -1,0 +1,108 @@
+# ─────────────────────────────────────────────────────────────
+# 本地私有配置 —— **绝不发布**
+#   prompts/persona.md 是开发机上的本地配置，只属于本机。
+#   发布包里带的是 prompts/persona.default.md（中性默认），谁装了都能用。
+#   使用者自己那份写在 $DOUYIN_HOME/persona.md，不在本仓库里。
+# ─────────────────────────────────────────────────────────────
+prompts/persona.md
+persona.md
+
+# ─────────────────────────────────────────────────────────────
+# 运行时数据 / 凭证 —— 一律不进仓库
+# （家在 $DSH_HOME/douyin-duty，本来就不在这个包里；这里只是防手滑拖进来）
+# ─────────────────────────────────────────────────────────────
+douyin_cookie.txt
+*.cookie
+*credential*.json
+account.json
+following.json
+config.json
+health.json
+collector.json
+notice.json
+seen.md
+charter.sha256
+reason.txt
+round-evidence.json
+forward-pick.json
+forward-msg.txt
+*.log
+
+chrome-profile/
+signer/
+toast/
+state/
+out/
+digest/
+inbox/
+
+# ─────────────────────────────────────────────────────────────
+# Python / Node 环境
+# ─────────────────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+node_modules/
+
+# ─────────────────────────────────────────────────────────────
+# 编辑器 / 系统垃圾
+# ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.tmp
+_probe-*
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ─────────────────────────────────────────────────────────────
+# 排查用的临时脚本 / 截图（**不进仓库**）
+#   里面常有本机路径、真实会话昵称、聊天预览截图
+# ─────────────────────────────────────────────────────────────
+_scratch/
+*.png
+
+# ─────────────────────────────────────────────────────────────
+# 桌宠素材 —— 主人私货（豆包生成的鲸鱼娘拆层），**绝不发布**。
+#   形象版权归主人；公开仓库只带 manifest 结构，谁装都能换自己的皮。
+# ─────────────────────────────────────────────────────────────
+assets/pet/
+
+
+# ─────────────────────────────────────────────────────────────
+# 桌宠 WebView2 宿主（tools/pet-host/）
+#   历史教训（2026-10-25 查出来）：子目录里的 .gitignore，模式是**相对该子目录**
+#   的 —— 原来写 `tools/pet-host/*.exe` 等于去找 `tools/pet-host/tools/pet-host/*.exe`，
+#   一条都匹配不到，exe / 微软的 DLL / 800MB 的 WebView2 用户目录全都变成"可提交"。
+#   所以这些规则**必须写在根 .gitignore**（这里），用根相对路径。
+#   进仓库的只有我们自己写的源码：PetHost.cs / build-host.ps1 / launch*.cmd / 探针脚本。
+# ─────────────────────────────────────────────────────────────
+tools/pet-host/*.exe
+tools/pet-host/*.exe.bak
+tools/pet-host/*.pdb
+tools/pet-host/*.dll
+tools/pet-host/*.config
+tools/pet-host/trace.txt
+tools/pet-host/pet-host-boot.log
+tools/pet-host/*.log
+tools/pet-host/pet-udf/
+tools/pet-host/*-udf/
+tools/pet-host/*-udf-*/
+tools/pet-host/comp-probe/
+tools/pet-host/v7-test/
+tools/pet-host/dll-2903-bak/
+
+# 临时提交信息文件（2026-10-26 误提交过一次）
+_cm.txt
+
+
+
+# ─────────────────────────────────────────────────────────────
+# fish 工程化（2026-10-27，阶段 3）
+#   vendor/upstream-<ref>/  上游只读快照，只给 scripts/diff-upstream.mjs 当基线（不进包）
+#   dist/                   本机打出来的 tgz，别进仓库
+#   FISH-PATCHES.md         生成产物，跟源码一起保留（方便对账）
+# ─────────────────────────────────────────────────────────────
+vendor/
+dist/

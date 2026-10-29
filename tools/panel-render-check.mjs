@@ -1,0 +1,899 @@
+/**
+ * tools/panel-render-check.mjs —— 在 Node 里把 client.js 真**渲染**一遍（不装 DSH）
+ * ============================================================================
+ * 为什么要有它：
+ *   面板整块的消失，过去全是"某个组件在渲染时抛错"引起的（TDZ / undefined / 拼错字段）。
+ *   `node --check` 只能查语法，查不出这类运行时错误 —— 2026-10-22 那次「重启多少次都看不见面板」
+ *   就是 import 阶段炸的，语法检查照样通过。
+ *   这里用一套**极小的 React 替身**（createElement / useState / useEffect / class）
+ *   把 Panel 真的执行一遍，然后走一遍元素树，确认每块卡片都在。
+ *
+ * 用法：node tools/panel-render-check.mjs      （selfcheck 4j 段会调它）
+ * 退出码 0 = 渲染通过。
+ * ============================================================================
+ */
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const HERE = dirname(fileURLToPath(import.meta.url))
+const ROOT = join(HERE, '..')
+
+/* ── 极简 React 替身 ── */
+let hooks = []
+let hookIdx = 0
+let rerender = null
+
+const React = {
+  createElement(type, props, ...children) {
+    return { type, props: { ...(props || {}), children: children.length ? (children.length === 1 ? children[0] : children) : undefined } }
+  },
+  useState(init) {
+    const i = hookIdx++
+    if (!(i in hooks)) hooks[i] = typeof init === 'function' ? init() : init
+    const set = (v) => {
+      const next = typeof v === 'function' ? v(hooks[i]) : v
+      if (JSON.stringify(next) !== JSON.stringify(hooks[i])) { hooks[i] = next; rerender?.() }
+    }
+    return [hooks[i], set]
+  },
+  useEffect(fn) {
+    const i = hookIdx++
+    if (!(i in hooks)) { hooks[i] = true; fn() }
+  },
+  useRef(init) {
+    const i = hookIdx++
+    if (!(i in hooks)) hooks[i] = { current: init }
+    return hooks[i]
+  },
+  Component: class { constructor(props) { this.props = props; this.state = {} } setState(p) { Object.assign(this.state, p); rerender?.() } },
+}
+
+/* ── DOM 替身 ── */
+const made = []
+globalThis.document = {
+  createElement: (tag) => { const el = { tag, style: {}, setAttribute() {}, appendChild() {}, remove() {} }; made.push(el); return el },
+  head: { appendChild() {} },
+  body: { appendChild() {}, removeChild() {} },
+  querySelector: () => null,
+  execCommand: () => true,
+}
+
+/* ── fetch 替身：接口返回写死 ──
+ * ⭐ 登录状态做成**可切换**的：先按"没登录"渲染一遍（这是新手的真实起点），
+ *    再切成"已登录"渲染一遍 —— 两条路都得能画出来。
+ */
+const state = { loggedIn: false, venvReady: false }
+// 🆕 可写的配置（模拟真实宿主：POST /config 写进磁盘，GET 读回来）
+const mockCfg = {
+  perDay: 5, maxPerRun: 12, noon: true, night: true, keywords: ['猫', '搞笑'],
+  windows: [{ start: '09:00', end: '11:00', label: '上午' }],
+  autoSend: true, commentAtMe: false, commentSelfName: '',
+  dmPeers: [], atPeers: [],
+}
+// 桌宠状态 mock（【桌宠】段里会改它再重渲染）
+const petState = { ok: true, state: 'watch', round_active: false, asset_ok: true, pet_on: true, chat: { on: true, result: 'ok', new_text: '', checked_ago: 5 } }
+const MOCK = {
+  '/api/douyin-duty/status': () => ({
+    ok: true, version: '9.9.9', home: 'H:/dy', loggedIn: state.loggedIn, venvReady: state.venvReady,
+    pickedToday: 2, report: 'H:/dy/out/2026-10-22.md', installing: false,
+  }),
+  '/api/douyin-duty/config': () => ({
+    ok: true,
+    config: { ...mockCfg },
+  }),
+  '/api/douyin-duty/update': () => ({
+    ok: true, current: '9.9.9', latest: '9.9.9', checked: true, hasUpdate: false, source: 'npm registry', tried: [],
+  }),
+  '/api/douyin-duty/ai-usage': () => ({
+    ok: true, doc: '# 使用说明',
+    mcp: { server: 'H:/dy/tools/mcp-server.mjs', exists: true, selfTest: 'node ".../mcp-server.mjs" --selftest', configText: '{\n  "mcpServers": {}\n}' },
+  }),
+  '/api/douyin-duty/report': () => ({ ok: true, text: '# 报告\n### 7401234567890123401' }),
+  '/api/douyin-duty/guide': () => ({ ok: true, text: '# 新手流程\n\n① 装环境\n② 扫码登录\n③ 用' }),
+  '/api/douyin-duty/account': () => ({
+    ok: true, logged_in: state.loggedIn,
+    account: state.loggedIn ? { nick: '测试账号昵称', uid: '9999000011112222', alive: true, at: new Date().toISOString() } : null,
+  }),
+  '/api/douyin-duty/persona': () => ({
+    ok: true, custom: false, text: '', default_text: '# 默认人设\n\n中性、不扮演任何人。', hint: '还没写自己的 —— 现在用的是默认人设',
+  }),
+  '/api/douyin-duty/memory': () => ({
+    ok: true, stats: { dir: 'H:/dy/memory', dm: 2, comment: 1, bytes: 4096 },
+  }),
+  '/api/douyin-duty/inbox': () => ({
+    ok: true,
+    at_n: 2,
+    dm_n: 1,
+    at: [
+      { nickname: '测试好友', content: '@测试账号昵称 出来一下', before: '没回过',
+        aweme_id: '7693806860863802662', comment_id: '7699090731688952613',
+        video_url: 'https://www.douyin.com/video/7693806860863802662',
+        my_comments_here: [{ at: '2026-10-22', text: '我之前在这说过一句', mention: '' }] },
+      { nickname: '另一个朋友', content: '@测试账号昵称 出来见人', before: '回过',
+        aweme_id: '7694192415963368730', comment_id: '7699009624113152825',
+        video_url: 'https://www.douyin.com/video/7694192415963368730', my_comments_here: [] },
+    ],
+    dm: [
+      { nick: '测试好友', sec_uid: 'MS4wLjABAAAA_test1', preview: '我也爱你', duplicate: false,
+        remembered: 11, their_last: { text: '我也爱你', at: '2026-10-22' }, last_from: 'them', needs_reply: true },
+    ],
+    errors: [],
+  }),
+  '/api/douyin-duty/chat/read': () => ({
+    ok: true, to: '测试好友', to_sec_uid: 'MS4wLjABAAAA_test1',
+    count: 3, mine: 2, them: 1, unknown: 0,
+    messages: [
+      { from: 'me', text: '爱你哟。', awe: 700 },
+      { from: 'them', text: '我也爱你', awe: 700 },
+      { from: 'me', text: '这条想让你看看', awe: 800 },
+    ],
+    context: { who: { nick: '测试好友' }, facts: ['喜欢猫', '在杭州'], recent: [], total_remembered: 11 },
+  }),
+  '/api/douyin-duty/chat/send': () => ({ ok: true, sent: true, to: '测试好友', len: 5 }),
+  '/api/douyin-duty/pet/state': () => petState,
+  '/api/douyin-duty/log': () => ({
+    ok: true, tail: '[示例日志]\n证据包已备好：12 条\n刷抖音开跑（manual）…',
+    lastRunAt: '2026-10-22T09:27:07.645Z', lastWhy: 'manual',
+    roundActive: false, canRun: true, pickedToday: 0, perDay: 5,
+  }),
+  // 扫码登录：默认成功给出 qr_url
+  '/api/douyin-duty/login/qr': () => ({ ok: true, qr_url: '/api/douyin-duty/login/qr.png?v=1', port: 9374 }),
+  // 登录成功会真的把登录态翻过来 —— 面板随后 refresh() 必须看到 true
+  '/api/douyin-duty/login/wait': () => { state.loggedIn = true; return { ok: true, logged_in: true, cookies: 9, hint: '登录成功' } },
+  '/api/douyin-duty/login/close': () => ({ ok: true, closed: true }),
+  '/api/douyin-duty/login/clear': () => { state.loggedIn = false; return { ok: true } },
+  '/api/douyin-duty/dm/people': () => ({
+    ok: true, count: 3,
+    people: [
+      { nick: '测试好友', sec_uid: 'MS4wLjABAAAA_test1', preview: '30分钟内在线', has_id: true, duplicate: false },
+      { nick: '另一个朋友', sec_uid: 'MS4wLjABAAAA_test2', preview: '好的', has_id: true, duplicate: true },
+      // 🔴 群聊：没有 sec_uid（抖音结构如此）—— 面板必须认得出它是群并写明限制
+      { nick: '测试群聊', sec_uid: '', preview: '群里在说话', has_id: false, duplicate: false, is_group: true },
+    ],
+    no_id_count: 1,
+    hint: '有同名的人 —— 选的时候看「最近一条消息」区分，别选错',
+  }),
+}
+globalThis.fetch = async (url, opts = {}) => {
+  const path = String(url).split('?')[0]
+  const method = String(opts?.method || 'GET').toUpperCase()
+  // 🆕 POST /config = 写配置（模拟真实宿主：写进磁盘，GET 能读回来）
+  if (method === 'POST' && path === '/api/douyin-duty/config') {
+    let body = {}
+    try { body = JSON.parse(String(opts?.body || '{}')) } catch { body = {} }
+    for (const [k, v] of Object.entries(body)) {
+      if (k === '__clearKeys') continue
+      mockCfg[k] = v
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, config: { ...mockCfg } }) }
+  }
+  const make = MOCK[path]
+  if (!make) return { ok: false, status: 404, json: async () => ({}) }
+  return { ok: true, status: 200, json: async () => make() }
+}
+const fakeNavigator = { clipboard: { writeText: async () => {} } }
+globalThis.window = { __ModuleLoader__: {}, navigator: fakeNavigator }
+
+/* ── 加载 client.js（它是给浏览器写的自注册脚本）── */
+let mod = null
+globalThis.window.__ModuleLoader__.load = (def) => {
+  mod = def.factory((name) => {
+    if (name === 'react') return React
+    throw new Error('未知依赖：' + name)
+  })
+}
+const src = readFileSync(join(ROOT, 'client.js'), 'utf8')
+// eslint-disable-next-line no-new-func
+new Function('window', 'document', 'navigator', 'fetch', src)(
+  globalThis.window, globalThis.document, fakeNavigator, globalThis.fetch,
+)
+if (!mod) throw new Error('client.js 没有调用 __ModuleLoader__.load')
+
+/* ── 把注册到 settings.section 的组件抓出来 ──
+ *    （2026-10-24 v2：桌宠搬进桌面级置顶窗口（独立的桌面窗进程）—— 主人要「悬浮所有窗口上」。
+ *    GUI 内浮层必须撤掉，不然同时出现两只她。这里守住：不许再注册 shell.overlay。） */
+let Registered = null
+let Overlay = null
+/** ⭐ 2026-10-27：插件现在注册**两个** settings.section（刷抖音 / 她的家）。
+ *  这个自检脚本原来只留"最后一个"，于是新加的「她的家」把「刷抖音」顶掉了，
+ *  后面点「扫码登录」全都找不到按钮 —— 保留全部、按 id 取回原面板。 */
+const Sections = new Map()
+const ctx = {
+  effect: (fn) => { try { fn() } catch { /* 清理函数 */ } },
+  get: (k) => (k === 'slots' ? {
+    inject: (slot, fn) => fn(),
+    register: (meta, comp) => {
+      if (meta?.name === 'settings.section') {
+        Sections.set(String(meta.id || ''), comp)
+        Registered = comp
+      } else if (meta?.name === 'shell.overlay') Overlay = comp
+      return () => {}
+    },
+  } : undefined),
+}
+mod.apply(ctx)
+Registered = Sections.get('douyin-scroll') || Registered
+if (!Registered) throw new Error('apply() 没有往 settings.section 注册组件')
+if (Overlay) { console.log('  ❌ 还在往 shell.overlay 注册 —— v2 起桌宠是桌面窗口，GUI 浮层必须撤（不然两只）'); fail++ }
+
+/* ── 迷你渲染器 ── */
+const isClass = (t) => typeof t === 'function' && t.prototype && typeof t.prototype.render === 'function'
+
+function render(el) {
+  if (el === null || el === undefined || el === false || el === true) return null
+  if (typeof el === 'string' || typeof el === 'number') return String(el)
+  if (Array.isArray(el)) return el.map(render)
+  const { type, props } = el
+  if (typeof type === 'function') {
+    if (isClass(type)) {
+      const inst = new type(props || {})
+      const out = inst.render()
+      return render(out)
+    }
+    return render(type(props || {}))
+  }
+  const kids = props?.children
+  return { tag: String(type), props: props || {}, children: kids === undefined ? [] : [].concat(render(kids)).flat(Infinity).filter((x) => x !== null) }
+}
+
+/** 把元素树拍平成 [tag, text] 便于检查 */
+function walk(node, out = []) {
+  if (node === null || node === undefined) return out
+  if (Array.isArray(node)) { for (const n of node) walk(n, out); return out }
+  if (typeof node === 'string') { out.push({ tag: '#text', text: node }); return out }
+  out.push({ tag: node.tag, text: '', props: node.props })
+  for (const c of node.children || []) walk(c, out)
+  return out
+}
+
+const flush = async () => { for (let i = 0; i < 8; i++) await new Promise((r) => setTimeout(r, 0)) }
+
+/** 取某个节点**子树**里的全部文字（按钮里的名字常在子 span 里，findBtn 只看按钮自己的 children 会漏） */
+function textOf(node, flatList) {
+  const list = flatList || flat
+  const i = list.findIndex((n) => n === node)
+  if (i < 0) return ''
+  let depth = 0
+  let out = ''
+  for (let k = i; k < list.length; k++) {
+    const n = list[k]
+    if (k > i && n.tag === 'button') break          // 到下一个按钮就收
+    if (n.tag === '#text') out += n.text
+  }
+  return out
+}
+
+let tree = null
+let renders = 0
+rerender = () => { renders++ }
+
+/**
+ * 渲染一遍并取元素树。
+ * ⚠️ hook 游标（hookIdx）必须在**每次渲染开始时**归零，让 useState 按调用顺序重新对齐；
+ *    hooks 数组本身**不能清**（那是状态存储）。
+ *    之前的 bug：renderNow() 里清了 hooks，导致点按钮 setState 写进去的值，
+ *    下一次渲染读到的是初始值（聊天界面就是这么"测不出来"的）。
+ */
+const renderNow = async () => {
+  hookIdx = 0
+  const t = render(React.createElement(Registered, {}))
+  await flush()
+  return t
+}
+
+// 第一遍：会显示"读设置中…"
+hooks = []
+tree = render(React.createElement(Registered, {}))
+await flush()
+
+/**
+ * ⭐ 关键：先按**新手真实起点**渲染 —— 没登录。
+ *    以前这里只测"已登录"那条路，结果登录 UI 崩了也发现不了。
+ */
+state.loggedIn = false
+tree = await renderNow()
+await renderNow()
+let flat = walk(tree)
+let allText = flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+
+let fail = 0
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * ⭐ 面板三组（2026-10-25 重排）：20+ 张卡压成 7 张 —— 组 ①永远是三张卡（不折叠），
+ *    组 ②「出问题才看」/ 组 ③「一次配好」**默认收起**。
+ *    折叠是设计的一部分，不是"渲染丢了" ⇒ 这里先验「默认确实收着」，
+ *    再**点开折叠组**，后面所有老断言照旧在展开后的树上跑（一条都不删、不弱化）。
+ *
+ *    ⚠️ 为什么必须点开：组 ②③ 里的按钮（检查更新 / 看接入方式 / 看今天的报告 /
+ *       检查环境 / 从我的会话里选 / 看记忆 / 看看谁找我…）收起来时根本不在 DOM 里，
+ *       不点开就找不到 —— 那是设计如此，不是缺功能。
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** 组标题：[{ name, btn }]，btn 非空 = 这一组能折叠（组 ① 是纯标题 div，没有按钮）
+ *  ⚠️ 结构是 h('div', {'data-dy-group':''}, h('button', {'data-dy-groupbtn':''}, …))，
+ *     所以「能折叠」的标志是组里有 data-dy-groupbtn 的按钮，不是容器自己是不是 button。 */
+const groupInfo = (f) => {
+  const out = []
+  f.forEach((n, i) => {
+    if (!(n.props && 'data-dy-groupname' in n.props)) return
+    // 紧跟其后的第一个文本节点就是组名
+    let j = i + 1
+    while (j < f.length && f[j].tag !== '#text') j++
+    const name = j < f.length ? f[j].text : ''
+    // 在整棵树里找带 data-dy-groupbtn 的按钮，用它的 toggle 闭包区分子组
+    // （该按钮的 onClick 是这一组自己的；面板只有两个折叠组，按出现顺序配给
+    //   「出问题才看」「一次配好」）
+    out.push({ name })
+  })
+  const btns = f.filter((n) => n.tag === 'button' && n.props && 'data-dy-groupbtn' in n.props)
+  // 折叠组按钮按文档顺序出现，且只属于可折叠的两组
+  let bi = 0
+  for (const g of out) {
+    if (g.name === '出问题才看' || g.name === '一次配好') g.btn = btns[bi++] || null
+    else g.btn = null
+  }
+  return out
+}
+
+/** 把还没展开的折叠组点开（幂等；最多 4 轮，防手滑写出死循环） */
+const openAllGroups = async (why) => {
+  for (let round = 0; round < 4; round++) {
+    hookIdx = 0
+    const t = render(React.createElement(Registered, {}))
+    await flush()
+    const f = walk(t)
+    const closed = groupInfo(f).filter((g) => g.btn && g.btn.props['data-open'] === undefined)
+    if (!closed.length) return t
+    try {
+      closed[0].btn.props.onClick({ target: { value: '' } })
+    } catch (e) {
+      console.log(`  ❌ 点开组「${closed[0].name}」抛错：${e?.message ?? e}`); fail++
+      return t
+    }
+    await flush()
+  }
+  console.log(`  ❌ 折叠组点不开（${why}）`); fail++
+  return render(React.createElement(Registered, {}))
+}
+
+/** 展开后重新取树 / 拍平 / 拼全文 */
+const expandAndFlatten = async (why) => {
+  const t = await openAllGroups(why)
+  const f = walk(t)
+  return { tree: t, flat: f, text: f.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ') }
+}
+
+/* ── ① 默认状态：三个组标题都在，组 ②③ 收着 ── */
+console.log('【折叠组 · 默认收起】')
+{
+  const gi = groupInfo(flat)
+  const names = gi.map((g) => g.name)
+  for (const want of ['常开必看', '出问题才看', '一次配好']) {
+    if (names.includes(want)) console.log(`  ✅ 有组标题「${want}」`)
+    else { console.log(`  ❌ 缺组标题「${want}」（实际：${JSON.stringify(names)}）`); fail++ }
+  }
+  const folds = gi.filter((g) => g.btn)
+  if (folds.length === 2) console.log('  ✅ 「出问题才看」「一次配好」两个组可折叠')
+  else { console.log(`  ❌ 可折叠组应为 2 个，实际 ${folds.length}`); fail++ }
+  const opened = folds.filter((g) => g.btn.props['data-open'] !== undefined)
+  if (!opened.length) console.log('  ✅ 两个折叠组默认都是收起的')
+  else { console.log(`  ❌ 这些组默认就展开了：${opened.map((g) => g.name).join('、')}`); fail++ }
+  // 收起时：组 ①的三张卡在，组 ②③ 的内容不在（这才是"收起来了"）
+  const cardsNow = flat.filter((n) => n.props && 'data-dy-card' in n.props).length
+  if (cardsNow === 3) console.log('  ✅ 收起时只有「常开必看」那 3 张卡')
+  else { console.log(`  ❌ 收起时卡片数应为 3，实际 ${cardsNow}`); fail++ }
+  for (const hidden of ['检查环境', '刷什么', '看看谁找我']) {
+    if (!allText.includes(hidden)) console.log(`  ✅ 收起时看不到「${hidden}」（在折叠组里）`)
+    else { console.log(`  ❌ 收起时仍然显示了「${hidden}」—— 折叠没生效`); fail++ }
+  }
+}
+
+/* ── ② 点开两个折叠组 → 全展开，后面所有断言都在这个状态上跑 ── */
+console.log('\n【折叠组 · 点开之后】')
+{
+  const r = await expandAndFlatten('默认收起状态')
+  tree = r.tree; flat = r.flat; allText = r.text
+  const cards = flat.filter((n) => n.props && 'data-dy-card' in n.props)
+  if (cards.length === 7) console.log('  ✅ 展开后正好 7 张 data-dy-card（顶层卡片）')
+  else { console.log(`  ❌ 展开后顶层卡片应为 7 张，实际 ${cards.length}`); fail++ }
+  const groups = flat.filter((n) => n.props && 'data-dy-group' in n.props)
+  if (groups.length === 3) console.log('  ✅ 3 个组标题（常开必看 / 出问题才看 / 一次配好）')
+  else { console.log(`  ❌ 组标题应为 3 个，实际 ${groups.length}`); fail++ }
+  // 组标题自己不是卡（卡片计数才是 7）
+  const groupAsCard = flat.filter((n) => n.props && 'data-dy-group' in n.props && 'data-dy-card' in n.props)
+  if (!groupAsCard.length) console.log('  ✅ 组标题不算卡片（用的是 data-dy-group，不是 data-dy-card）')
+  else { console.log('  ❌ 组标题被标成了卡片 —— 卡片数会不准'); fail++ }
+  // 七张卡的关键文案：一个功能都不许丢
+  for (const [label, re] of [
+    ['卡①开始使用', /开始使用/],
+    ['卡②刷抖音', /现在跑一轮/],
+    ['卡③自动发送（含私信对象 / 评论区@你 / 聊天模式）', /自动发送[\s\S]*私信发给谁|私信发给谁/],
+    ['卡④出问题了？', /出问题了？/],
+    ['卡⑤刷抖音的策略', /刷抖音的策略/],
+    /* 🔴 2026-10-26 主人：「补充人设那一栏只要一个标题就行了，就叫做人设」
+     *    ⇒ 卡片标题 = 「人设」；里面**不再重复**一个「补充人设」小标题
+     *      （主人明确说"不要有两个"），所以这里断言卡片标题是「人设」，
+     *      并反向断言旧的那个重复标题不许回来。 */
+    ['卡⑥人设（联动桌宠开关已隐藏）', /人设/],
+    ['卡⑦消息与记忆', /消息与记忆/],
+  ]) {
+    if (re.test(allText)) console.log(`  ✅ ${label}`)
+    else { console.log(`  ❌ ${label} 不在展开后的面板里`); fail++ }
+  }
+  // 反向断言：被主人点掉的那个开关不许重新冒出来
+  if (/联动桌宠/.test(allText)) { console.log('  ❌ 「联动桌宠」开关又出现在面板上了 —— 主人 2026-10-26 要求暂时不要出现'); fail++ }
+  else console.log('  ✅ 「联动桌宠」开关按主人要求暂时隐藏（HIDE_PET_LINK）')
+}
+
+console.log('\n【没登录时】—— 新手看到的第一屏')
+const firstRunMust = [
+  ['开始使用', /开始使用/],
+  ['进度：还差两步', /还差\s*两步/],
+  ['第①步：装环境', /装运行环境/],
+  ['第②步：扫码登录按钮', /扫码登录/],
+  ['扫码提示（手机抖音 → 扫一扫）', /扫一扫|扫码/],
+  ['出问题？体检入口', /出问题了？/],
+]
+for (const [label, re] of firstRunMust) {
+  if (re.test(allText)) console.log(`  ✅ ${label}`)
+  else { console.log(`  ❌ ${label} —— 找不到 ${re}`); fail++ }
+}
+if (/node tools\/qr-login\.mjs/.test(allText)) {
+  console.log('  ❌ 面板里还在让用户敲命令行 —— 新手走不到')
+  fail++
+} else console.log('  ✅ 面板里没有"自己去敲命令行"的登录指引')
+
+/* ── 点「扫码登录」：应该出二维码 ── */
+const findBtnIn = (f, label) => f.find((n) => n.tag === 'button' &&
+  String([].concat(n.props?.children ?? []).flat(Infinity).join('')).includes(label))
+
+const clickIn = async (f, label) => {
+  const btn = findBtnIn(f, label)
+  if (!btn) { console.log(`  ❌ 找不到按钮「${label}」`); fail++; return null }
+  try {
+    await btn.props.onClick({ target: { value: '' } })
+  } catch (e) { console.log(`  ❌ 点「${label}」抛错：${e?.message ?? e}`); fail++; return null }
+  await flush()
+  const t = await renderNow()
+  return walk(t)
+}
+
+console.log('\n【点「扫码登录」】')
+flat = await clickIn(flat, '扫码登录')
+if (flat) {
+  const txt = flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+  const img = flat.find((n) => n.tag === 'img' && n.props && n.props['data-dy-qr'] !== undefined)
+  if (img) console.log('  ✅ 二维码图片出来了')
+  else { console.log('  ❌ 点完没有二维码图片'); fail++ }
+  if (/我扫完了/.test(txt)) console.log('  ✅ 有「我扫完了」按钮')
+  else { console.log('  ❌ 没有「我扫完了」'); fail++ }
+  if (/重新出码/.test(txt)) console.log('  ✅ 有「重新出码」')
+  else { console.log('  ❌ 没有「重新出码」'); fail++ }
+  if (/短信验证码/.test(txt) && /滑块/.test(txt)) console.log('  ✅ 提前说明了可能要过短信/滑块')
+  else { console.log('  ❌ 没提短信/滑块验证 —— 新手会以为扫失败'); fail++ }
+}
+
+/* ── 点「我扫完了」：登录成功 → 面板切成已登录 ── */
+console.log('\n【点「我扫完了」】')
+flat = await clickIn(flat, '我扫完了')
+if (flat) {
+  const txt = flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+  if (/登录成功/.test(txt)) console.log('  ✅ 提示登录成功')
+  else { console.log('  ❌ 没说登录成功'); fail++ }
+}
+
+/* ── 已登录状态：确认另一条路也画得出来 ── */
+state.loggedIn = true
+state.venvReady = true
+/**
+ * ⭐ 这里必须**重新挂载**（清空 hooks）而不是只重渲染：
+ *    面板的 st/cfg 是 useState 里的状态，只换 mock 数据不会自己变。
+ *    清空 hooks ⇒ 重新跑 useEffect ⇒ 重新 fetch ⇒ 拿到新状态。
+ *    （真实场景里对应"关掉设置页再打开"或 login 成功后的 refresh()）
+ */
+hooks = []
+tree = render(React.createElement(Registered, {}))
+// useEffect 里的 fetch 是异步的：多冲几次让 Promise 链走完，否则只看到"读设置中…"
+for (let i = 0; i < 6; i++) {
+  await new Promise((r) => setTimeout(r, 0))
+  tree = await renderNow()
+}
+// ⭐ 重新挂载会把折叠状态重置成"收起"（这正是真实用户重新打开设置页的样子）——
+//    后面要验的按钮都在折叠组里，所以先点开（openAllGroups 是幂等的）。
+{
+  const opened = await expandAndFlatten('已登录重新挂载后')
+  tree = opened.tree
+}
+flat = walk(tree)
+allText = flat.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+
+console.log('\n【已登录时】')
+if (/已登录，可以刷了/.test(allText)) console.log('  ✅ 显示"已登录，可以刷了"')
+else { console.log('  ❌ 已登录状态没显示'); fail++ }
+if (/都装好了/.test(allText)) console.log('  ✅ 显示"都装好了"')
+else { console.log('  ❌ 没显示就绪'); fail++ }
+if (flat.find((n) => n.tag === 'img' && n.props && n.props['data-dy-qr'] !== undefined)) {
+  console.log('  ❌ 已登录了还在显示二维码'); fail++
+} else console.log('  ✅ 已登录时不显示二维码')
+
+const must = [
+  ['状态卡：刷抖音标题', /刷抖音/],
+  ['现在跑一轮按钮', /现在跑一轮/],
+  ['刷什么（关键词）', /刷什么/],
+  ['什么时候自己跑', /什么时候自己跑/],
+  ['中午谷时', /中午谷时/],
+  ['晚上谷时', /晚上谷时/],
+  ['自定义时段', /自定义时段/],
+  ['自定义时段里的时间输入框', /09:00/],
+  ['+ 加一个时段', /\+ 加一个时段/],
+  ['保存时段', /保存时段/],
+  ['给别的 AI 用', /给别的 AI 用/],
+  ['MCP 配置说明', /MCP server/],
+  ['关于 / 检查更新', /检查更新/],
+  ['版本号', /v9\.9\.9/],
+]
+
+console.log(`\n渲染了 ${renders} 次状态更新，元素树 ${flat.length} 个节点\n`)
+for (const [label, re] of must) {
+  if (re.test(allText)) console.log(`  ✅ ${label}`)
+  else { console.log(`  ❌ ${label} —— 渲染结果里找不到 ${re}`); fail++ }
+}
+
+// 结构检查：卡片数量、时间输入框数量
+const cards = flat.filter((n) => n.props && 'data-dy-card' in n.props)
+const timeInputs = flat.filter((n) => n.tag === 'input' && n.props && n.props.type === 'time')
+console.log(`\n卡片 ${cards.length} 个 / 时间输入框 ${timeInputs.length} 个`)
+if (cards.length < 6) { console.log('  ❌ 卡片少于 6 块，可能有一块没渲染出来'); fail++ }
+else console.log('  ✅ 卡片齐全')
+if (timeInputs.length !== 2) { console.log(`  ❌ 时间输入框应为 2 个（一个时段），实际 ${timeInputs.length}`); fail++ }
+else console.log('  ✅ 一个自定义时段 = 两个时间输入框')
+
+// 事件处理器检查：所有 onClick 必须是函数（写错成 onClick: foo() 会立刻执行）
+const badHandlers = flat.filter((n) => n.props && 'onClick' in n.props && typeof n.props.onClick !== 'function')
+if (badHandlers.length) { console.log(`  ❌ ${badHandlers.length} 个 onClick 不是函数`); fail++ }
+else console.log('  ✅ 所有 onClick 都是函数')
+
+/* ── 点一遍按钮：光"能显示"不够，按钮真跑起来也得不出错 ──
+ * 这一段把三个异步动作真的 await 一遍：
+ *   ① 检查更新  ② 看接入方式（MCP）  ③ 看报告
+ * 每个按钮的 onClick 直接调，不用模拟事件 —— 我们要验的是**数据回来之后能不能渲染**。
+ */
+const findBtn = (label) => flat.find((n) => n.tag === 'button' &&
+  String(([].concat(n.props?.children ?? []).flat(Infinity).join(''))).includes(label))
+
+const clickAndRender = async (label) => {
+  const btn = findBtn(label)
+  if (!btn) { console.log(`  ❌ 找不到按钮「${label}」`); fail++; return }  try {
+    await btn.props.onClick({ target: { value: '' } })
+  } catch (e) {
+    console.log(`  ❌ 点「${label}」抛错：${e?.message ?? e}`); fail++; return
+  }
+  await flush()
+  hookIdx = 0
+  const t = render(React.createElement(Registered, {}))
+  await flush()
+  const f = walk(t)
+  const txt = f.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+  console.log(`  ✅ 点「${label}」没抛错，渲染 ${f.length} 节点`)
+  return { tree: t, flat: f, text: txt }
+}
+
+console.log('\n点按钮实测：')
+const rUpdate = await clickAndRender('检查更新')
+if (rUpdate) {
+  if (/已是最新版|有新版本|查不到最新版本/.test(rUpdate.text)) console.log('  ✅ 检查更新结果渲染出来了')
+  else { console.log('  ❌ 检查更新后没有结果文案'); fail++ }
+}
+const rAi = await clickAndRender('看接入方式')
+if (rAi) {
+  if (/mcpServers/.test(rAi.text)) console.log('  ✅ MCP 配置渲染出来了')
+  else { console.log('  ❌ 看接入方式后没有 MCP 配置'); fail++ }
+  if (/复制 MCP 配置/.test(rAi.text)) console.log('  ✅ 有复制按钮')
+  else { console.log('  ❌ 没有复制按钮'); fail++ }
+}
+const rRep = await clickAndRender('看今天的报告')
+if (rRep) {
+  if (/7401234567890123401/.test(rRep.text)) console.log('  ✅ 报告内容渲染出来了')
+  else { console.log('  ❌ 报告没渲染出来'); fail++ }
+}
+const rDoc = await clickAndRender('检查环境')
+if (rDoc) {
+  if (/检查完|环境/.test(rDoc.text)) console.log('  ✅ 环境体检结果渲染出来了')
+  else { console.log('  ❌ 体检结果没渲染'); fail++ }
+}
+
+/* ── 私信对象：点「从我的会话里选」应该列出人，点人能选中 ── */
+console.log('\n【私信发给谁】')
+const rPeople = await clickAndRender('从我的会话里选')
+if (rPeople) {
+  if (/测试好友/.test(rPeople.text)) console.log('  ✅ 列出会话里的人')
+  else { console.log('  ❌ 没列出会话里的人'); fail++ }
+  if (/重名/.test(rPeople.text)) console.log('  ✅ 同名的人标了「重名」')
+  else { console.log('  ❌ 同名没标出来'); fail++ }
+  // ⚠️ 人的名字在**子节点**里（不是按钮自己的 children 文本），要查整棵子树
+  const personBtn = rPeople.flat.find((n) => n.tag === 'button' && n.props && n.props['data-dy-person'] !== undefined)
+  if (personBtn) {
+    try {
+      await personBtn.props.onClick()
+      await flush()
+      const f = walk(await renderNow())
+      const txt = f.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+      // 0.5.5：点人 = 加进 dmPeers 列表（不再是"已选"单选）
+      if (/已在列表|加进私信对象|已把/.test(txt)) console.log('  ✅ 点人能加进私信对象列表（0.5.5 多人）')
+      else { console.log('  ❌ 点人没加进列表'); fail++ }
+    } catch (e) { console.log(`  ❌ 点人抛错：${e?.message ?? e}`); fail++ }
+  } else { console.log('  ❌ 找不到可点的人'); fail++ }
+}
+
+/* ── 「怎么用？」应该能展开新手流程 ── */
+console.log('\n【怎么用？】')
+const rGuide = await clickAndRender('怎么用？')
+if (rGuide) {
+  if (/新手流程/.test(rGuide.text) && /扫码登录/.test(rGuide.text)) console.log('  ✅ 展开了新手流程说明')
+  else { console.log('  ❌ 没展开说明'); fail++ }
+}
+
+/* ── 登录后要显示账号 ── */
+console.log('\n【登录后显示账号】')
+if (/测试账号昵称/.test(allText)) console.log('  ✅ 显示了登录的账号昵称')
+else { console.log('  ❌ 没显示账号昵称 —— 用户不知道在给谁刷'); fail++ }
+if (/9999000011112222/.test(allText)) { console.log('  ❌ 还显示了账号 ID —— 用户说只要昵称就行'); fail++ }
+else console.log('  ✅ 只显示昵称，不显示 ID')
+
+/* ── 私信对象：手动加人（0.5.5 按钮改名「手动加一个」） ── */
+console.log('\n【私信对象：手动加】')
+const rManual = await clickAndRender('手动加一个')
+if (rManual) {
+  const nickInput = rManual.flat.find((n) => n.tag === 'input' && n.props && String(n.props.placeholder || '').includes('示例好友'))
+  const idInput = rManual.flat.find((n) => n.tag === 'input' && n.props && String(n.props.placeholder || '').includes('MS4wLjABAAAA'))
+  if (nickInput) console.log('  ✅ 有昵称输入框')
+  else { console.log('  ❌ 没有昵称输入框'); fail++ }
+  if (idInput) console.log('  ✅ 有稳定 ID 输入框（可留空）')
+  else { console.log('  ❌ 没有稳定 ID 输入框'); fail++ }
+}
+
+/* ── 补回来的功能：每天几条 / 日报多细 / 通知方式 ── */
+console.log('\n【每天挑几条 / 日报 / 通知】')
+const r10 = await renderNow()
+const flatAll = walk(r10)
+const txtAll = flatAll.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+for (const [label, re] of [
+  ['每天挑几条', /每天挑几条/],
+  ['日报详细程度', /日报写多细/],
+  ['通知方式', /通知：/],
+]) {
+  if (re.test(txtAll)) console.log(`  ✅ ${label}`)
+  else { console.log(`  ❌ 缺「${label}」`); fail++ }
+}
+const selects = flatAll.filter((n) => n.tag === 'select')
+if (selects.length >= 2) console.log(`  ✅ ${selects.length} 个下拉框`)
+else { console.log(`  ❌ 下拉框只有 ${selects.length} 个`); fail++ }
+
+/* ── 我的人设：能写、能存，而且**要说清现在用的是哪一份** ──
+   历程（别改回去）：
+     · 2026-10-25 主人说「插件面板人设跟人格重合了」→ 曾改名「补充人设（可选）」
+     · 2026-10-26 主人说「只要一个标题，就叫做人设」→ 去掉重复小标题
+     · 2026-10-26 主人说「人设是不是该改成我的人设」+「默认的是不是有问题」
+       ⇒ 标题定型为「我的人设」；并且后端开始返回 effective/effective_label，
+         面板必须**明确说出当前生效的是哪一份**（自己写 / 插件自带 / 中性默认）。
+       原因：以前只读自己那份，没写就空框 + 提示"用的是默认"，
+       而实际生效的是插件自带那份 16970 字节的完整人设 —— 面板在说谎。 */
+console.log('\n【我的人设】')
+const rPersona = await clickAndRender('展开')
+if (rPersona) {
+  const ta = rPersona.flat.find((n) => n.tag === 'textarea')
+  if (ta) console.log('  ✅ 人设文本框出来了')
+  else { console.log('  ❌ 人设文本框没出来'); fail++ }
+  // 三种来源说法都要被识别（后端 effective_label 给的就是这些词）
+  if (/正在用你写的|插件自带的那份|中性默认/.test(rPersona.text)) console.log('  ✅ 说明了当前用的是哪一份（自己写/插件自带/中性默认）')
+  else { console.log('  ❌ 没说当前用哪份'); fail++ }
+}
+
+/* ── 对话记忆 ── */
+console.log('\n【对话记忆】')
+const rMem = await clickAndRender('看记忆')
+if (rMem) {
+  if (/私信记忆 2 个人/.test(rMem.text) && /评论区记忆 1 条视频/.test(rMem.text)) {
+    console.log('  ✅ 显示了记忆统计')
+  } else { console.log('  ❌ 记忆统计没显示'); fail++ }
+  if (/清空全部记忆/.test(rMem.text)) console.log('  ✅ 有「清空全部记忆」按钮')
+  else { console.log('  ❌ 没有清空按钮'); fail++ }
+}
+
+/* ── 消息：评论区 @ 我 + 谁私信我 ── */
+console.log('\n【消息（收件箱）】')
+const rInbox = await clickAndRender('看看谁找我')
+if (rInbox) {
+  if (/评论区 @ 我：2 条/.test(rInbox.text)) console.log('  ✅ 显示评论区 @ 的数量')
+  else { console.log('  ❌ 没显示 @ 数量'); fail++ }
+  if (/出来一下/.test(rInbox.text)) console.log('  ✅ 列出 @ 我的内容')
+  else { console.log('  ❌ 没列出 @ 内容'); fail++ }
+  if (/我之前在这说过一句/.test(rInbox.text)) console.log('  ✅ 带上了"我在这条视频下说过什么"（记忆）')
+  else { console.log('  ❌ 没带"我说过什么"'); fail++ }
+  if (/该回了/.test(rInbox.text)) console.log('  ✅ 私信标了「该回了」')
+  else { console.log('  ❌ 私信没标该不该回'); fail++ }
+  if (/记 11/.test(rInbox.text)) console.log('  ✅ 显示跟这个人记得多少条')
+  else { console.log('  ❌ 没显示记忆条数'); fail++ }
+}
+
+/* ── 聊天模式（带记忆） ── */
+console.log('\n【聊天模式】')
+/**
+ * ⚠️ 这里不能复用 clickAndRender：它内部用的 `flat` 是**初次渲染**那棵树，
+ *    收件箱是后面点出来的，节点在 rInbox.flat 里。
+ *    ⚠️ 而且 rInbox.flat 里**也包含**「私信发给谁」那张卡的人（也带 data-dy-person），
+ *       点那个只会"选中收件人"，不会打开聊天 ⇒ 用 `data-dy-inbox-dm` 精确区分。
+ */
+const chatPersonBtn = (rInbox ? rInbox.flat : []).find((n) =>
+  n.tag === 'button' && n.props && n.props['data-dy-inbox-dm'] !== undefined)
+let rChat = null
+if (chatPersonBtn) {
+  try {
+    await chatPersonBtn.props.onClick()
+  } catch (e) { console.log(`  ❌ 点人抛错：${e?.message ?? e}`); fail++ }
+  await flush()
+  // 连渲染几次，让 openChat 里的 await jpost → setChat 走完
+  for (let i = 0; i < 4; i++) {
+    await new Promise((r) => setTimeout(r, 0))
+    hookIdx = 0
+    const t = render(React.createElement(Registered, {}))
+    await flush()
+    const f = walk(t)
+    const txt = f.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+    if (/跟 .+ 聊/.test(txt)) { rChat = { flat: f, text: txt }; break }
+  }
+  if (rChat) console.log('  ✅ 点人能打开聊天')
+  else { console.log('  ❌ 点了人但聊天界面没出来'); fail++ }
+} else { console.log('  ❌ 找不到可点的私信人'); fail++ }
+if (rChat) {
+  if (/跟 测试好友 聊/.test(rChat.text)) console.log('  ✅ 打开了聊天界面')
+  else { console.log('  ❌ 没打开聊天界面'); fail++ }
+  if (/记得关于他的：喜欢猫、在杭州/.test(rChat.text)) console.log('  ✅ 显示了记忆里的长期事实')
+  else { console.log('  ❌ 没显示记忆事实'); fail++ }
+  const bubbles = rChat.flat.filter((n) => n.props && n.props['data-dy-bubble'] !== undefined)
+  if (bubbles.length >= 3) console.log(`  ✅ 渲染了 ${bubbles.length} 条消息气泡`)
+  else { console.log(`  ❌ 消息气泡只有 ${bubbles.length} 条`); fail++ }
+  const mineB = rChat.flat.find((n) => n.props && n.props['data-dy-bubble'] !== undefined && n.props['data-mine'] !== undefined)
+  const themB = rChat.flat.find((n) => n.props && n.props['data-dy-bubble'] !== undefined && n.props['data-them'] !== undefined)
+  if (mineB && themB) console.log('  ✅ 我的和他的气泡分开了')
+  else { console.log('  ❌ 气泡没区分谁发的'); fail++ }
+  const input = rChat.flat.find((n) => n.tag === 'input' && n.props && String(n.props.placeholder || '').includes('说点什么'))
+  if (input) console.log('  ✅ 有输入框')
+  else { console.log('  ❌ 没有输入框'); fail++ }
+  if (/分享卡片/.test(rChat.text)) console.log('  ✅ 分享卡片有标记')
+  else { console.log('  ❌ 卡片没标记'); fail++ }
+}
+
+/* ── 自动发送开关 ── */
+console.log('\n【自动发送开关】')
+if (/自动发送/.test(allText) && /会自动发|只写报告/.test(allText)) console.log('  ✅ 有自动发送开关卡片')
+else { console.log('  ❌ 没有自动发送开关'); fail++ }
+// ⭐ 2026-10-22 用户明确要求：默认就是发。所以已登录状态下应该显示"会自动发"
+if (/会自动发/.test(allText)) console.log('  ✅ 默认显示"会自动发"')
+else { console.log('  ❌ 默认状态不对（应该是"会自动发"）'); fail++ }
+if (/只管「插件自己在后台跑的轮次」/.test(allText)) console.log('  ✅ 说清了适用范围（只管后台轮次）')
+else { console.log('  ❌ 没说清适用范围'); fail++ }
+// 卡片位置（🔴 2026-10-24 主人令新顺序：开始使用置顶 → 刷抖音 → 自动发送 → 评论区@我）
+{
+  const iStart = allText.indexOf('开始使用')
+  const iAuto = allText.indexOf('自动发送')
+  // iStart=-1 才算"没有开始使用卡"；=0 正是置顶成功
+  if (iStart >= 0 && iAuto > iStart) console.log('  ✅ 「开始使用」置顶、自动发送在其后（新顺序）')
+  else { console.log(`  ❌ 卡片顺序不对（开始使用@${iStart} 自动发送@${iAuto}）—— 开始使用应置顶`); fail++ }
+}
+
+/* ── 「评论区 @ 提醒」（0.5.8：没有开关，选人即开、清掉即关） ── */
+console.log('\n【评论区 @ 提醒】')
+if (/评论区 @ 提醒/.test(allText)) console.log('  ✅ 有「评论区 @ 提醒」区块（0.5.8 无开关设计）')
+else { console.log('  ❌ 没有「评论区 @ 提醒」'); fail++ }
+if (/总闸关着 —— 选了人也不 @/.test(allText)) console.log('  ✅ 开关关闭态说明清楚了（0.5.9 总闸+多选）')
+else { console.log('  ❌ 开关关闭态没说明'); fail++ }
+// 位置：必须在「自动发送」之后
+{
+  const iSend = allText.indexOf('自动发送')
+  const iAtMe = allText.indexOf('评论区 @ 提醒')
+  if (iSend >= 0 && iAtMe > iSend) console.log('  ✅ 位置正确（自动发送下面）')
+  else { console.log(`  ❌ 位置不对（自动发送@${iSend} 评论区@提醒@${iAtMe}）`); fail++ }
+}
+
+/* ── 🔴 群聊限制必须写在明面上（主人 2026-10-26：「不在选项上说清吗」） ──
+ *    以前只藏在 hover 的 title 小字里 ⇒ 选了群也不知道发不出去。
+ *    现在：① 群标签写「只能看不能发」② 选了群就出现一条黄条说明。 */
+console.log('\n【群聊限制（明写，不藏 hover）】')
+{
+  // ① 源码里必须有那条黄条（渲染检查读的是源码文案）
+  const src = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  if (/可能发不出/.test(src)) console.log('  ✅ 群标签写明「可能发不出」（不把一次观察说成铁律）')
+  else { console.log('  ❌ 群标签没写「可能发不出」'); fail++ }
+  // ⚠️ 措辞要求：大白话、短句 —— 主人 2026-10-26 令「你这么说谁看得懂，简单点」
+  if (/群里可能发不出消息/.test(src) && /手机端正常/.test(src)) {
+    console.log('  ✅ 面板用大白话说清「群里可能发不出消息，手机端正常」')
+  } else { console.log('  ❌ 面板没用大白话（要写「群里可能发不出消息」「手机端正常」）'); fail++ }
+  // ⚠️ 主人 2026-10-26 令：「不要说这么绝对，要说可能，你又没用别的号试过」
+  if (/在我这个号上试的|别的号不一定/.test(src)) {
+    console.log('  ✅ 面板注明「只在一个号上试过，别的号不一定」')
+  } else { console.log('  ❌ 面板没注明测试范围（别把一次观察说成铁律）'); fail++ }
+  if (/7523|服务端收下|渠道限制/.test(src)) {
+    console.log('  ⚠️ 面板还留着行话（7523 / 服务端收下 / 渠道限制）—— 主人嫌绕，建议再删')
+  } else console.log('  ✅ 面板没有行话（7523 那些只留在文档里）')
+  // ② 选中群之后必须真的渲染出那条黄条
+  //    （会话列表要先点「从我的会话里选」才加载出来；群名在按钮的**子节点**里）
+  await clickAndRender('从我的会话里选')
+  const gFlat = walk(await renderNow())
+  const gBtn = gFlat.find((n) => n.tag === 'button' && n.props && n.props['data-dy-person'] !== undefined
+    && /测试群聊/.test(textOf(n, gFlat)))
+  if (!gBtn) {
+    console.log('  ❌ 会话列表里找不到群（假数据里得有群才测得了）'); fail++
+  } else {
+    try {
+      await gBtn.props.onClick({ target: { value: '' } })
+      await flush()
+      const gf = walk(await renderNow())
+      const gtxt = gf.filter((n) => n.tag === '#text').map((n) => n.text).join(' | ')
+      if (/群里可能发不出消息/.test(gtxt) && /手机端正常/.test(gtxt)) {
+        console.log('  ✅ 选中群后，面板上出现群聊限制说明（不是藏起来的）')
+      } else {
+        console.log('  ❌ 选中群后没看到限制说明（提示被藏起来了）'); fail++
+      }
+    } catch (e) { console.log(`  ❌ 点群抛错：${e?.message ?? e}`); fail++ }
+  }
+}
+
+/* ── 🔴 真 @ 的工具名不能写错（2026-10-26 修）──
+ *    值班提示词原来让模型调 douyin_comment_reply + mode:"ui"，
+ *    但真 @ 的工具叫 douyin_comment_mention（reply 只能发普通评论）。 */
+console.log('\n【真 @ 工具名】')
+{
+  const idx = readFileSync(new URL('../index.js', import.meta.url), 'utf8')
+  if (/douyin_comment_mention/.test(idx)) console.log('  ✅ 值班提示词指向 douyin_comment_mention（真 @ 专用）')
+  else { console.log('  ❌ 值班提示词没提 douyin_comment_mention'); fail++ }
+  if (/mode = "ui"|mode="ui"/.test(idx)) {
+    console.log('  ❌ 值班提示词还在用 mode:"ui"（douyin_comment_reply 没这个参数，会发成普通评论）'); fail++
+  } else console.log('  ✅ 没让模型用不存在的 mode:"ui" 参数')
+}
+
+/* ── 看日志 ── */
+console.log('\n【看日志】')
+const rLog = await clickAndRender('看日志')
+if (rLog) {
+  if (/证据包已备好/.test(rLog.text)) console.log('  ✅ 日志内容显示出来了')
+  else { console.log('  ❌ 日志没显示'); fail++ }
+  if (/上次跑：/.test(rLog.text)) console.log('  ✅ 显示上次跑的时间')
+  else { console.log('  ❌ 没显示上次跑时间'); fail++ }
+}
+
+/* ── 桌宠联动（2026-10-25 拆分：窗口/人格/弹幕归独立插件 dsh-deskpet，这里只剩状态源）── */
+console.log('\n【桌宠联动】')
+{
+  const idx = readFileSync(join(ROOT, 'index.js'), 'utf8')
+  const cl = readFileSync(join(ROOT, 'client.js'), 'utf8')
+  // ⚠️ 断言看**去掉注释后的代码**：为什么要拆、搬走了什么，这些解释都在注释里，
+  //    全文搜会把"注释里说我们不写 pet-window-state.json"误判成"我们在写"。
+  const idxCode = idx.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:])\/\/[^\n]*/g, '$1 ')
+  // ⚠️ 拆分后的规矩（这条守的是"两个插件不许抢同一个文件"）：
+  //    抖音侧可以读状态、可以提供状态源，但**不许**再写 pet-window-state.json ——
+  //    那文件归 dsh-deskpet 写。两个都写 = 谁后落盘谁赢 = 她说的话随机消失。
+  if (/petStateOf/.test(idxCode)) console.log('  ✅ 状态聚合在（petStateOf，给状态源用）')
+  else { console.log('  ❌ 状态聚合没了'); fail++ }
+  if (/deskpetStateSource/.test(idxCode)) console.log('  ✅ 有状态源注册（deskpetStateSource）')
+  else { console.log('  ❌ 没有状态源注册 —— 桌宠那边拿不到抖音的状态'); fail++ }
+  if (/petWinWrite|pet-window-state\.json/.test(idxCode)) { console.log('  ❌ 抖音侧还在写 pet-window-state.json —— 会跟桌宠互相覆盖'); fail++ }
+  else console.log('  ✅ 抖音侧不写窗口状态文件（归 dsh-deskpet）')
+  if (/spawn\(hostExe|PetHost\.exe/.test(idxCode)) { console.log('  ❌ 抖音侧还在拉起窗口进程 —— 会跟桌宠抢实例'); fail++ }
+  else console.log('  ✅ 抖音侧不拉窗口（窗口归 dsh-deskpet）')
+  /* 🔴 2026-10-26 主人：「联动桌宠选项暂时不要出现」
+   *   代码还在（HIDE_PET_LINK 控制），但界面上不许出现这个开关。
+   *   所以要断言的是「源码里有 petLinkTo」「界面上没有联动桌宠」。 */
+  if (/petLinkTo/.test(cl)) console.log('  ✅ 联动能力仍在源码里（petLinkTo，HIDE_PET_LINK 可恢复）')
+  else { console.log('  ❌ 连 petLinkTo 都没了 —— 恢复时得重写'); fail++ }
+  if (/HIDE_PET_LINK\s*=\s*true/.test(cl)) console.log('  ✅ 「联动桌宠」开关按主人要求隐藏（HIDE_PET_LINK=true）')
+  else { console.log('  ❌ HIDE_PET_LINK 不在 —— 那个开关会冒出来'); fail++ }
+  if (/slots\.inject\('shell\.overlay'/.test(cl)) { console.log('  ❌ 还在往 shell.overlay 注册（会出两只她）'); fail++ }
+  else console.log('  ✅ GUI 内没有浮层（只有桌面窗一只）')
+}
+
+console.log(fail ? `\n渲染检查：${fail} 项失败` : '\n渲染检查：全部通过')
+// ⚠️ 组件里的 setInterval（桌宠/状态屏轮询）没有清理替身会执行 —— 进程会挂着不退，
+//    selfcheck 的 spawnSync 有 timeout 但每次都拖满 120 秒。显式退出。
+process.exit(fail ? 1 : 0)
